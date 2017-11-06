@@ -1,15 +1,17 @@
 #!/usr/bin/env python
 
-# Route GLUE2 messages
-#   from a source (amqp, file, directory)
+# Route computing_activity messages
+#   and synchronize ComputingQueue Model state
+#   into the ComputingActvities Model
+# from a source (amqp, file, directory)
 #   to a destination (print, directory, warehouse, api)
-from __future__ import print_function
+
 from __future__ import print_function
 import amqp
 import argparse
 import base64
 import datetime
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 import logging.handlers
@@ -31,12 +33,30 @@ except ImportError:
 
 import django
 django.setup()
+from django.db import DataError, IntegrityError
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from glue2_provider.process import Glue2ProcessRawIPF, StatsSummary
+from glue2_db.models import ComputingActivity, ComputingQueue
+from xsede_warehouse.stats import StatsTracker
 
 from daemon import runner
 import pdb
 
-class Route_Glue2():
+# Select Activity field cache
+# New activities that match the cache aren't updated in the db to optimize performance
+# The cache has a timestamp we can use to expire and reset the contents
+a_cache = {}
+a_cache_ts = timezone.now()
+
+def get_Validity(obj):
+    try:
+        val = timedelta(seconds=obj['Validity'])
+    except:
+        val = None
+    return val
+
+class Route_Jobs():
     def __init__(self):
         self.args = None
         self.config = {}
@@ -55,10 +75,10 @@ class Route_Glue2():
                             help='Message destination {print, directory, warehouse, or api} (default=print)')
         parser.add_argument('-l', '--log', action='store', \
                             help='Logging level (default=warning)')
-        parser.add_argument('-c', '--config', action='store', default='./route_glue2.conf', \
-                            help='Configuration file default=./route_glue2.conf')
-        parser.add_argument('-q', '--queue', action='store', default='glue2-router', \
-                            help='AMQP queue default=glue2-router')
+        parser.add_argument('-c', '--config', action='store', default='./route_jobs.conf', \
+                            help='Configuration file default=./route_jobs.conf')
+        parser.add_argument('-q', '--queue', action='store', default='jobs-router', \
+                            help='AMQP queue default=jobs-router')
         parser.add_argument('--verbose', action='store_true', \
                             help='Verbose output')
         parser.add_argument('--daemon', action='store_true', \
@@ -94,13 +114,8 @@ class Route_Glue2():
             numeric_log = getattr(logging, 'INFO', None)
         if not isinstance(numeric_log, int):
             raise ValueError('Invalid log level: %s' % numeric_log)
-#        self.logger = logging.getLogger('DaemonLog')
         self.logger = logging.getLogger('xsede.glue2')
         self.logger.setLevel(numeric_log)
-#       self.formatter = logging.Formatter(fmt='%(asctime)s %(message)s', datefmt='%Y/%m/%d %H:%M:%S')
-#       self.handler = logging.handlers.TimedRotatingFileHandler(self.config['LOG_FILE'], when='W6', backupCount=999, utc=True)
-#       self.handler.setFormatter(self.formatter)
-#       self.logger.addHandler(self.handler)
 
         # Verify arguments and parse compound arguments
         if 'src' not in self.args or not self.args.src: # Tests for None and empty ''
@@ -115,7 +130,7 @@ class Route_Glue2():
             self.src['type'] = self.args.src
         if self.src['type'] == 'dir':
             self.src['type'] = 'directory'
-        elif self.src['type'] not in ['amqp', 'file', 'directory']:
+        elif self.src['type'] not in ['amqp', 'file', 'directory', 'queuetable']:
             self.logger.error('Source not {amqp, file, directory}')
             sys.exit(1)
         if self.src['type'] == 'amqp':
@@ -321,21 +336,12 @@ class Route_Glue2():
             return
         try:
             obj = json.loads(data)
-    #        if isinstance(obj, dict):
-    #            self.logger.info(StatsSummary(obj))
-    #        else:
-    #            self.logger.error('Response %s' % obj)
-    #            raise ValueError('')
         except ValueError as e:
             self.logger.error('API response not in expected format (%s)' % e)
 
     def dest_warehouse(self, ts, doctype, resourceid, message_body):
         proc = Glue2ProcessRawIPF(application=os.path.basename(__file__), function='dest_warehouse')
         (code, message) = proc.process(ts, doctype, resourceid, message_body)
-#        if code is False:
-#            self.logger.error(message)
-#        else:
-#            self.logger.info(message)
 
     def process_file(self, path):
         file_name = path.split('/')[-1]
@@ -370,13 +376,146 @@ class Route_Glue2():
             self.dest_restapi(ts, doctype, resourceid, data)
         elif self.dest['type'] == 'print':
             self.dest_print(ts, doctype, resourceid, data)
-    
-    # Where we process
+
+    def process_queuetable(self):
+        import pdb
+        # Frequency to load ComputingQueue (our input)
+        Queue_RefreshInterval = timedelta(seconds=10)
+        Queue_NextRefresh = datetime.now() - Queue_RefreshInterval # Force initial refresh
+        Queue = {}
+        Processed = {}
+
+        while True:
+            LoopStart = datetime.now()
+            Processed_Count = 0
+            
+            if LoopStart > Queue_NextRefresh:
+                objects = ComputingQueue.objects.all()
+                for obj in objects:
+                    sortkey = '{:%Y-%m-%d %H:%M:%S.%f}:{}'.format(obj.CreationTime, obj.ResourceID)
+                    Queue[sortkey] = obj
+                Queue_NextRefresh = datetime.now() + Queue_RefreshInterval
+        
+            for key in sorted(Queue):
+                ResourceID = Queue[key].ResourceID
+                CreationTime = Queue[key].CreationTime
+                if ResourceID in Processed and Processed[ResourceID] == CreationTime:
+                    continue # No change since last processed
+                Jobs = Queue[key].EntityJSON
+                self.process_jobs(ResourceID, CreationTime, Jobs)
+                Processed[ResourceID] = CreationTime
+                Processed_Count += 1
+                if datetime.now() > Queue_NextRefresh: # Let's loop around and refresh the Queue
+                    break
+            else: # We've finished the sorted(Queue)
+                LoopEnd = datetime.now()
+                SleepFor = max(0.01, (Queue_NextRefresh - datetime.now()).total_seconds()) # No less than a 1/100 sec.
+                self.logger.info('Loop Start={:%H:%M:%S.%f}, Refresh={:%H:%M:%S.%f}, Processed={}, Sleeping={}'.format(LoopStart, Queue_NextRefresh, Processed_Count, SleepFor))
+                try:
+                    sleep(SleepFor)
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    self.logger.error('Failed to sleep for "{}"'.format(SleepFor))
+                continue # To outer loop
+            # We should only fall thru if we break above (passed the next refresh)
+            LoopEnd = datetime.now()
+            self.logger.info('Loop Start={:%H:%M:%S.%f}, Refresh={:%H:%M:%S.%f}, Processed={}'.format(LoopStart, Queue_NextRefresh, Processed_Count))
+
+    def process_jobs(self, ResourceID, CreationTime, Jobs):
+        ########################################################################
+        # Stores individual job entries
+        # Improve ComputingActivity awareness so as to only write what needs to be written
+        ########################################################################
+        me = 'ComputingActivity'
+        # Load new entries
+        self.resourceid = ResourceID
+        self.stats = StatsTracker(self.resourceid, me)
+        self.new = {}   # Contains new object json
+        self.cur = {}   # Contains existing object references
+        self.new[me] = {}
+        self.cur[me] = {}
+
+        self.new[me] = Jobs
+        self.stats.set('%s.New' % me, len(Jobs))
+
+        # Load current database entries
+        if not self.cur[me]:
+            for item in ComputingActivity.objects.filter(ResourceID=self.resourceid):
+                self.cur[me][item.ID] = item
+            self.stats.set('%s.Current' % me, len(self.cur[me]))
+
+        # Add/update entries
+        for ID in self.new[me]:
+            if ID in self.cur[me] and parse_datetime(self.new[me][ID]['CreationTime']) <= self.cur[me][ID].CreationTime:
+                self.new[me][ID]['model'] = self.cur[me][ID]    # Save the latest object reference
+                continue                                        # Don't update database since is has the latest
+
+            if self.activity_is_cached(ID, self.new[me][ID]):
+                self.stats.add('%s.ToCache' % me, 1)
+                continue
+
+            try:
+                model = ComputingActivity(ID=self.new[me][ID]['ID'],
+                                          ResourceID=self.resourceid,
+                                          Name=self.new[me][ID].get('Name', 'none'),
+                                          CreationTime=self.new[me][ID]['CreationTime'],
+                                          Validity=get_Validity(self.new[me][ID]),
+                                          EntityJSON=self.new[me][ID])
+                model.save()
+                self.new[me][ID]['model'] = model
+                self.stats.add('%s.Updates' % me, 1)
+
+                self.activity_to_cache(ID, self.new[me][ID])
+            
+            except (DataError, IntegrityError) as e:
+                raise ProcessingException('%s updating %s (ID=%s): %s' % (type(e).__name__, me, self.new[me][ID]['ID'], \
+                                        e.message), status=status.HTTP_400_BAD_REQUEST)
+
+        # Delete old entries
+        for ID in self.cur[me]:
+            if ID in self.new[me]:
+                continue
+            try:
+                ComputingActivity.objects.filter(ID=ID).delete()
+                self.cur[me].pop(ID)
+                self.stats.add('%s.Deletes' % me, 1)
+            except (DataError, IntegrityError) as e:
+                raise ProcessingException('%s deleting %s (ID=%s): %s' % (type(e).__name__, me, ID, e.message), \
+                                          status=status.HTTP_400_BAD_REQUEST)
+
+        self.stats.end()
+        self.logger.info(self.stats.summary())
+
+    def activity_is_cached(self, id, obj): # id=object unique id
+        global a_cache
+        global a_cache_ts
+        if (timezone.now() - a_cache_ts).total_seconds() > 3600:    # Expire cache every hour (3600 seconds)
+            a_cache_ts = timezone.now()
+            a_cache = {}
+            logg2.debug('Expiring Activity cache')
+
+        return id in a_cache and a_cache[id] == self.activity_hash(obj)
+
+    def activity_to_cache(self, id, obj):
+        global a_cache
+        a_cache[id] = self.activity_hash(obj)
+
+    def activity_hash(self, obj):
+        hash_list = []
+        if 'State' in obj:
+            hash_list.append(obj['State'])
+        if 'UsedTotalWallTime' in obj:
+            hash_list.append(obj['UsedTotalWallTime'])
+        return(json.dumps(hash_list))
+
+###############################################################################################
+# Where we process
+###############################################################################################
     def run(self):
         signal.signal(signal.SIGINT, self.exit_signal)
 
-        self.logger.info('Starting program=%s pid=%s, uid=%s(%s)' % \
-                     (os.path.basename(__file__), os.getpid(), os.geteuid(), pwd.getpwuid(os.geteuid()).pw_name))
+        self.logger.info('Starting program={} pid={}, uid={}({})'.format(os.path.basename(__file__), os.getpid(), os.geteuid(), pwd.getpwuid(os.geteuid()).pw_name))
         self.logger.info('Source: ' + self.src['display'])
         self.logger.info('Destination: ' + self.dest['display'])
 
@@ -386,8 +525,7 @@ class Route_Glue2():
             self.channel.basic_qos(prefetch_size=0, prefetch_count=4, a_global=True)
             declare_ok = self.channel.queue_declare(queue=self.args.queue, durable=True, auto_delete=False)
             queue = declare_ok.queue
-            exchanges = ['glue2.applications', 'glue2.compute', 'glue2.computing_activities']
-#            exchanges = ['glue2.applications', 'glue2.compute']
+            exchanges = ['glue2.computing_activities']
             for ex in exchanges:
                 self.channel.queue_bind(queue, ex, '#')
             self.logger.info('AMQP Queue={}, Exchanges=({})'.format(self.args.queue, ', '.join(exchanges)))
@@ -418,8 +556,11 @@ class Route_Glue2():
                         if os.path.isfile(fullfile2):
                             self.process_file(fullfile2)
 
+        elif self.src['type'] == 'queuetable':
+            self.process_queuetable()
+
 if __name__ == '__main__':
-    router = Route_Glue2()
+    router = Route_Jobs()
     if router.args.daemonaction is None:
         # Interactive execution
         myrouter = router.run()
