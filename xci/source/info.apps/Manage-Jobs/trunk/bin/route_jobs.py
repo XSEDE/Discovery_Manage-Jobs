@@ -36,8 +36,10 @@ django.setup()
 from django.db import DataError, IntegrityError
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from rest_framework import status
 from glue2_provider.process import Glue2ProcessRawIPF, StatsSummary
 from glue2_db.models import ComputingActivity, ComputingQueue
+from xsede_warehouse.exceptions import ProcessingException
 from xsede_warehouse.stats import StatsTracker
 
 from daemon import runner
@@ -378,49 +380,51 @@ class Route_Jobs():
             self.dest_print(ts, doctype, resourceid, data)
 
     def process_queuetable(self):
-        import pdb
         # Frequency to load ComputingQueue (our input)
-        Queue_RefreshInterval = timedelta(seconds=10)
-        Queue_NextRefresh = datetime.now() - Queue_RefreshInterval # Force initial refresh
-        Queue = {}
-        Processed = {}
+        Queue_RefreshInterval = timedelta(seconds=15)
+        Queue_RefreshTS = datetime.now() - Queue_RefreshInterval # Force initial refresh
+	Queue = {}
+        Queue_Done = {}
 
         while True:
-            LoopStart = datetime.now()
-            Processed_Count = 0
+            Iter_StartTS = datetime.now()                  # Start timestamp
+            Iter_Processed = 0                             # How many resource queues we processed
+            Iter_Sleep = 0                                 # Default no sleep at end of iteration
             
-            if LoopStart > Queue_NextRefresh:
+            if Iter_StartTS > Queue_RefreshTS:             # Refresh the input queue if past target TS
+        	Queue = {}
                 objects = ComputingQueue.objects.all()
                 for obj in objects:
                     sortkey = '{:%Y-%m-%d %H:%M:%S.%f}:{}'.format(obj.CreationTime, obj.ResourceID)
                     Queue[sortkey] = obj
-                Queue_NextRefresh = datetime.now() + Queue_RefreshInterval
+                Queue_RefreshTS = datetime.now() + Queue_RefreshInterval  # Next refresh
         
             for key in sorted(Queue):
                 ResourceID = Queue[key].ResourceID
                 CreationTime = Queue[key].CreationTime
-                if ResourceID in Processed and Processed[ResourceID] == CreationTime:
+		if Queue_Done.get(ResourceID) == CreationTime:
                     continue # No change since last processed
                 Jobs = Queue[key].EntityJSON
                 self.process_jobs(ResourceID, CreationTime, Jobs)
-                Processed[ResourceID] = CreationTime
-                Processed_Count += 1
-                if datetime.now() > Queue_NextRefresh: # Let's loop around and refresh the Queue
+                Queue_Done[ResourceID] = CreationTime
+                Iter_Processed += 1
+                if datetime.now() > Queue_RefreshTS:       # Break out to refresh the queue
                     break
-            else: # We've finished the sorted(Queue)
-                LoopEnd = datetime.now()
-                SleepFor = max(0.01, (Queue_NextRefresh - datetime.now()).total_seconds()) # No less than a 1/100 sec.
-                self.logger.info('Loop Start={:%H:%M:%S.%f}, Refresh={:%H:%M:%S.%f}, Processed={}, Sleeping={}'.format(LoopStart, Queue_NextRefresh, Processed_Count, SleepFor))
+            else: # We finished the sorted(Queue)
+                Iter_Sleep = max(0.01, (Queue_RefreshTS - datetime.now()).total_seconds()) # At least 1/100 sec.
+
+            Iter_FinishTS = datetime.now()
+            Iter_Seconds = (Iter_FinishTS - Iter_StartTS).total_seconds()
+            if Iter_Sleep == 0:
+                self.logger.info('Iteration {} resources in {}/sec'.format(Iter_Processed, Iter_Seconds ))
+            else:
+                self.logger.info('Iteration {} resources in {}/sec, Sleeping={}'.format(Iter_Processed, Iter_Seconds, Iter_Sleep))
                 try:
-                    sleep(SleepFor)
+                    sleep(Iter_Sleep)
                 except KeyboardInterrupt:
                     raise
                 except Exception:
-                    self.logger.error('Failed to sleep for "{}"'.format(SleepFor))
-                continue # To outer loop
-            # We should only fall thru if we break above (passed the next refresh)
-            LoopEnd = datetime.now()
-            self.logger.info('Loop Start={:%H:%M:%S.%f}, Refresh={:%H:%M:%S.%f}, Processed={}'.format(LoopStart, Queue_NextRefresh, Processed_Count))
+                    self.logger.error('Failed sleep({})'.format(Iter_Sleep))
 
     def process_jobs(self, ResourceID, CreationTime, Jobs):
         ########################################################################
@@ -438,6 +442,7 @@ class Route_Jobs():
 
         self.new[me] = Jobs
         self.stats.set('%s.New' % me, len(Jobs))
+        self.logger.debug('Processing {}, jobs={}'.format(ResourceID, len(Jobs)))
 
         # Load current database entries
         if not self.cur[me]:
@@ -448,7 +453,7 @@ class Route_Jobs():
         # Add/update entries
         for ID in self.new[me]:
             if ID in self.cur[me] and parse_datetime(self.new[me][ID]['CreationTime']) <= self.cur[me][ID].CreationTime:
-                self.new[me][ID]['model'] = self.cur[me][ID]    # Save the latest object reference
+#               self.new[me][ID]['model'] = self.cur[me][ID]    # Save the latest object reference
                 continue                                        # Don't update database since is has the latest
 
             if self.activity_is_cached(ID, self.new[me][ID]):
@@ -463,37 +468,43 @@ class Route_Jobs():
                                           Validity=get_Validity(self.new[me][ID]),
                                           EntityJSON=self.new[me][ID])
                 model.save()
-                self.new[me][ID]['model'] = model
+#               self.new[me][ID]['model'] = model
                 self.stats.add('%s.Updates' % me, 1)
 
                 self.activity_to_cache(ID, self.new[me][ID])
             
-            except (DataError, IntegrityError) as e:
+            except (DataError, IntegrityError, TypeError) as e:
+		pdb.set_trace()
+		self.logger.debug("EntityJSON={}".format(self.new[me][ID]))
                 raise ProcessingException('%s updating %s (ID=%s): %s' % (type(e).__name__, me, self.new[me][ID]['ID'], \
                                         e.message), status=status.HTTP_400_BAD_REQUEST)
 
         # Delete old entries
+	dels = []
         for ID in self.cur[me]:
             if ID in self.new[me]:
                 continue
             try:
                 ComputingActivity.objects.filter(ID=ID).delete()
-                self.cur[me].pop(ID)
+		dels.append(ID)
                 self.stats.add('%s.Deletes' % me, 1)
             except (DataError, IntegrityError) as e:
+		pdb.set_trace()
                 raise ProcessingException('%s deleting %s (ID=%s): %s' % (type(e).__name__, me, ID, e.message), \
                                           status=status.HTTP_400_BAD_REQUEST)
+	for ID in dels:
+            self.cur[me].pop(ID)
 
         self.stats.end()
         self.logger.info(self.stats.summary())
 
     def activity_is_cached(self, id, obj): # id=object unique id
-        global a_cache
+        global a_cache   	# JobID is key, fingerprint fields are the value
         global a_cache_ts
         if (timezone.now() - a_cache_ts).total_seconds() > 3600:    # Expire cache every hour (3600 seconds)
-            a_cache_ts = timezone.now()
             a_cache = {}
-            logg2.debug('Expiring Activity cache')
+            a_cache_ts = timezone.now()
+            self.logger.debug('Expiring Activity cache')
 
         return id in a_cache and a_cache[id] == self.activity_hash(obj)
 
@@ -502,6 +513,7 @@ class Route_Jobs():
         a_cache[id] = self.activity_hash(obj)
 
     def activity_hash(self, obj):
+	# These fields are the fingerprint for what is in the database
         hash_list = []
         if 'State' in obj:
             hash_list.append(obj['State'])
@@ -515,7 +527,7 @@ class Route_Jobs():
     def run(self):
         signal.signal(signal.SIGINT, self.exit_signal)
 
-        self.logger.info('Starting program={} pid={}, uid={}({})'.format(os.path.basename(__file__), os.getpid(), os.geteuid(), pwd.getpwuid(os.geteuid()).pw_name))
+        self.logger.info('Starting program={} pid={} uid={}({})'.format(os.path.basename(__file__), os.getpid(), os.geteuid(), pwd.getpwuid(os.geteuid()).pw_name))
         self.logger.info('Source: ' + self.src['display'])
         self.logger.info('Destination: ' + self.dest['display'])
 
