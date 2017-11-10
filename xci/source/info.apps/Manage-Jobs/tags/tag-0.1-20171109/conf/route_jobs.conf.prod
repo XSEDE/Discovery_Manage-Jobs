@@ -1,0 +1,16 @@
+{
+    "SOURCE": "amqp:info1.dyn.xsede.org:5671",
+    "DESTINATION": "warehouse",
+    "DESTINATION_API": "api:info1.dyn.xsede.org:443",
+    "AMQP_USERID": "jobs-router",
+    "AMQP_PASSWORD": "xxxxxxxxxxxxxxx",
+    "API_USERID": "jobsrouter",
+    "API_PASSWORD": "xxxxxxxxxxxxxxx",
+    "X509_CACERTS": "/path/to/pem/",
+    "X509_CERT": "/soft/warehouse-apps-1.0/conf/cert.pem",
+    "X509_KEY": "/soft/warehouse-apps-1.0/conf/key.pem",
+    "LOG_FILE": "/soft/warehouse-apps-1.0/Manage-Jobs/var/route_jobs.log",
+    "LOG_LEVEL": "debug",
+    "RUN_DIR": "/soft/warehouse-apps-1.0/Manage-Jobs/var",
+    "PID_FILE": "/soft/warehouse-apps-1.0/Manage-Jobs/var/route_jobs.pid"
+}
