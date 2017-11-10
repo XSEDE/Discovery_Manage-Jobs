@@ -10,8 +10,6 @@ from __future__ import print_function
 import amqp
 import argparse
 import base64
-import datetime
-from datetime import datetime, timedelta
 import json
 import logging
 import logging.handlers
@@ -34,22 +32,118 @@ except ImportError:
 import django
 django.setup()
 from django.db import DataError, IntegrityError
-from django.utils import timezone
-from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from glue2_provider.process import Glue2ProcessRawIPF, StatsSummary
 from glue2_db.models import ComputingActivity, ComputingQueue
 from xsede_warehouse.exceptions import ProcessingException
 from xsede_warehouse.stats import StatsTracker
 
+# Use datetime for local and timezone non-sensitive data
+# Use timezone for distributed and timezone sensitive data
+import datetime
+from datetime import datetime, timedelta
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+
 from daemon import runner
 import pdb
 
-# Select Activity field cache
-# New activities that match the cache aren't updated in the db to optimize performance
+# Activity cache to avoid unnecessary db updates and enhance performance
+# Uses a fingerprint of relevant fields
+# New activities that match the cache aren't updated
 # The cache has a timestamp we can use to expire and reset the contents
 a_cache = {}
 a_cache_ts = timezone.now()
+
+#
+# Time capture sequence:
+#   Job.CreationTime: when the job entry was captured (origin) AT THE SP
+#   QueueReceivedTS:  when the job queue was received by the glue2 router
+#                   which is stored in ComputingQueue
+#   Iter_StartTS:   when this job queue processing started by the job router
+#   timezone.now(): when this job queue processing finished (when we're called)
+#
+# Timings collected:
+#    recv_*         timing from job capture at SP to received by router (average for jobs)
+#    pstart_*       timing from job received by router to processing started (average for queues)
+#    pdone_*        timing from processing started to processing done (average for queues)
+#
+# Performance metrics for each resource
+# -> [ResourceID] -> 'queue_count' = <total job queues was processed>
+#                 -> 'jobs_count' = <total jobs across all job queues processed>
+#                 -> 'totaltime_recv' = <total time from query at SP(Job.CreationTime)
+#                                   to route_glue2 received (ComputingQueue.CreationTime)>
+#                 -> 'totaltime_pstart' = <total time from route_glue2 received
+#                                   to processing started
+#                 -> 'totaltime_pdone' = <total time from processing started to done
+#
+p_metrics = {}
+p_metrics_count = 0
+p_metrics_enabled = False   # When we start procesing recent queues
+
+def capture_metrics(ResourceID, Jobs, QueueReceivedTS, Iter_StartTS):
+    global p_metrics_enabled
+    if not p_metrics_enabled:
+        return
+    recv_ttime = 0
+    recv_count = 0
+    first_capture = None
+    for j in Jobs:
+        try:
+            capture_time = parse_datetime(Jobs[j]['CreationTime']) + timedelta(seconds=0.5) # More accurage
+        except:
+            pass
+        else:
+            if capture_time: # Skip if None
+                if first_capture is None:
+                    first_capture = capture_time
+                else:
+                    first_capture = min(first_capture, capture_time)
+                recv_count += 1
+                recv_ttime += (QueueReceivedTS - capture_time).total_seconds()
+
+#    print('{}: {} {} {}'.format(ResourceID, first_capture, QueueReceivedTS, Iter_StartTS))
+
+    global p_metrics
+    if ResourceID not in p_metrics:
+        p_metrics[ResourceID] = {'queue_count': 0, 'jobs_count': 0, 'totaltime_recv': 0, 'totaltime_pstart': 0, 'totaltime_proc': 0}
+    my_pm = p_metrics[ResourceID]
+    my_pm['queue_count'] += 1
+    my_pm['jobs_count'] += recv_count
+    if recv_count > 0:
+        my_pm['totaltime_recv'] += recv_ttime / recv_count   # The average for jobs in a queue
+    my_pm['totaltime_pstart'] += (Iter_StartTS - QueueReceivedTS).total_seconds()
+    my_pm['totaltime_proc'] += (timezone.now() - Iter_StartTS).total_seconds()
+    global p_metrics_count
+    p_metrics_count += 1
+
+def dump_metrics(self):
+    global p_metrics_count
+    if p_metrics_count <= 100:
+        return
+    global p_metrics
+    t_count = 0
+    t_items = 0
+    t_recv = 0
+    t_pstart = 0
+    t_proc = 0
+    for ResourceID in p_metrics:
+        my_pm = p_metrics[ResourceID]
+        if my_pm['queue_count'] > 0:
+            avg_jobs = my_pm['jobs_count'] / my_pm['queue_count']
+            avg_recv = my_pm['totaltime_recv'] / my_pm['queue_count']
+            avg_pstart = my_pm['totaltime_pstart'] / my_pm['queue_count']
+            avg_proc = my_pm['totaltime_proc'] / my_pm['queue_count']
+            self.logger.debug('resource={} {}/items: jobs/item={}, to_receive={}, to_beginprocess={}, to_process={}'.format(ResourceID, my_pm['queue_count'], avg_jobs, avg_recv, avg_pstart, avg_proc))
+            t_count += 1
+            t_items += my_pm['queue_count']
+            t_recv += avg_recv
+            t_pstart += avg_pstart
+            t_proc += avg_proc
+
+    self.logger.info('METRICS {}/items: to_receive={}, to_beginprocess={}, to_process={}, end-to-end={}'.format(t_items, t_recv / t_count, t_pstart / t_count, t_proc / t_count, (t_recv / t_count) + (t_pstart / t_count) + (t_proc / t_count)))
+    p_metrics = {}
+    p_metrics_count = 0
 
 def get_Validity(obj):
     try:
@@ -212,7 +306,7 @@ class Route_Jobs():
                 lines=file.read()
                 file.close()
                 if not re.match("^started with pid \d+$", lines) and not re.match("^$", lines):
-                    ts = datetime.strftime(datetime.now(), '%Y-%m-%d_%H:%M:%S')
+                    ts = datetime.strftime(timezone.now(), '%Y-%m-%d_%H:%M:%S')
                     newpath = '%s.%s' % (path, ts)
                     shutil.copy(path, newpath)
                     print('SaveDaemonLog as ' + newpath)
@@ -223,7 +317,7 @@ class Route_Jobs():
     def exit_signal(self, signal, frame):
         self.logger.error('Caught signal, exiting...')
         sys.exit(0)
-
+    
     def ConnectAmqp_Anonymous(self):
         return amqp.Connection(host='%s:%s' % (self.src['host'], self.src['port']), virtual_host='xsede')
     #                           heartbeat=2)
@@ -381,46 +475,51 @@ class Route_Jobs():
 
     def process_queuetable(self):
         # Frequency to load ComputingQueue (our input)
-        Queue_RefreshInterval = timedelta(seconds=15)
-        Queue_RefreshTS = datetime.now() - Queue_RefreshInterval # Force initial refresh
-	Queue = {}
+        Queue_RefreshInterval = timedelta(seconds=5)
+        Queue_RefreshTS = timezone.now() - Queue_RefreshInterval # Force initial refresh
+        Queue = {}
         Queue_Done = {}
 
         while True:
-            Iter_StartTS = datetime.now()                  # Start timestamp
+            Iter_StartTS = timezone.now()                  # Start timestamp
             Iter_Processed = 0                             # How many resource queues we processed
             Iter_Sleep = 0                                 # Default no sleep at end of iteration
             
             if Iter_StartTS > Queue_RefreshTS:             # Refresh the input queue if past target TS
-        	Queue = {}
+                Queue = {}
                 objects = ComputingQueue.objects.all()
                 for obj in objects:
                     sortkey = '{:%Y-%m-%d %H:%M:%S.%f}:{}'.format(obj.CreationTime, obj.ResourceID)
                     Queue[sortkey] = obj
-                Queue_RefreshTS = datetime.now() + Queue_RefreshInterval  # Next refresh
+                Queue_RefreshTS = timezone.now() + Queue_RefreshInterval  # Next refresh
         
             for key in sorted(Queue):
                 ResourceID = Queue[key].ResourceID
                 CreationTime = Queue[key].CreationTime
-		if Queue_Done.get(ResourceID) == CreationTime:
+                if Queue_Done.get(ResourceID) == CreationTime:
                     continue # No change since last processed
                 Jobs = Queue[key].EntityJSON
                 self.process_jobs(ResourceID, CreationTime, Jobs)
+                capture_metrics(ResourceID, Jobs, CreationTime, Iter_StartTS)
                 Queue_Done[ResourceID] = CreationTime
                 Iter_Processed += 1
-                if datetime.now() > Queue_RefreshTS:       # Break out to refresh the queue
+                if timezone.now() > Queue_RefreshTS:       # Break out to refresh the queue
                     break
             else: # We finished the sorted(Queue)
-                Iter_Sleep = max(0.01, (Queue_RefreshTS - datetime.now()).total_seconds()) # At least 1/100 sec.
+                Iter_Sleep = max(0.01, (Queue_RefreshTS - timezone.now()).total_seconds()) # At least 1/100 sec.
 
-            Iter_FinishTS = datetime.now()
+            Iter_FinishTS = timezone.now()
             Iter_Seconds = (Iter_FinishTS - Iter_StartTS).total_seconds()
             if Iter_Sleep == 0:
-                self.logger.info('Iteration {} resources in {}/sec'.format(Iter_Processed, Iter_Seconds ))
+                self.logger.info('Iteration {}/queues in {:0.6f}/sec'.format(Iter_Processed, Iter_Seconds ))
             else:
-                self.logger.info('Iteration {} resources in {}/sec, Sleeping={}'.format(Iter_Processed, Iter_Seconds, Iter_Sleep))
+                if Iter_Processed > 0:
+                    self.logger.info('Iteration {}/queues in {:0.6f}/sec, sleeping={:0.6f}/sec'.format(Iter_Processed, Iter_Seconds, Iter_Sleep))
+                dump_metrics(self)
                 try:
                     sleep(Iter_Sleep)
+                    global p_metrics_enabled
+                    p_metrics_enabled = True
                 except KeyboardInterrupt:
                     raise
                 except Exception:
@@ -442,7 +541,7 @@ class Route_Jobs():
 
         self.new[me] = Jobs
         self.stats.set('%s.New' % me, len(Jobs))
-        self.logger.debug('Processing {}, jobs={}'.format(ResourceID, len(Jobs)))
+        self.logger.debug('Processing {} {}/jobs'.format(ResourceID, len(Jobs)))
 
         # Load current database entries
         if not self.cur[me]:
@@ -474,25 +573,22 @@ class Route_Jobs():
                 self.activity_to_cache(ID, self.new[me][ID])
             
             except (DataError, IntegrityError, TypeError) as e:
-		pdb.set_trace()
-		self.logger.debug("EntityJSON={}".format(self.new[me][ID]))
                 raise ProcessingException('%s updating %s (ID=%s): %s' % (type(e).__name__, me, self.new[me][ID]['ID'], \
                                         e.message), status=status.HTTP_400_BAD_REQUEST)
 
         # Delete old entries
-	dels = []
+        dels = []
         for ID in self.cur[me]:
             if ID in self.new[me]:
                 continue
             try:
                 ComputingActivity.objects.filter(ID=ID).delete()
-		dels.append(ID)
+                dels.append(ID)
                 self.stats.add('%s.Deletes' % me, 1)
             except (DataError, IntegrityError) as e:
-		pdb.set_trace()
                 raise ProcessingException('%s deleting %s (ID=%s): %s' % (type(e).__name__, me, ID, e.message), \
                                           status=status.HTTP_400_BAD_REQUEST)
-	for ID in dels:
+        for ID in dels:
             self.cur[me].pop(ID)
 
         self.stats.end()
