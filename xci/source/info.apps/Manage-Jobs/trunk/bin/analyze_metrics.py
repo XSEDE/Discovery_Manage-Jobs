@@ -2,7 +2,7 @@
 # Analayze metrics in input_file of the form:
 # 2017-11-10 05:18:02,544 INFO METRICS 108/items: to_receive=7.23729864999, to_beginprocess=25.5092452334, to_process=14.503572165, end-to-end=47.2501160484
 
-input_file = '/soft/warehouse-apps-1.0/Manage-Jobs/var/django_xsede_warehouse.log'
+input_file = '/soft/warehouse-apps-1.0/Manage-Jobs/var/route_jobs.log'
 of_interest = {'to_receive=': [], 'to_beginprocess=': [], 'to_process=': [], 'end-to-end=': []}
 
 with open(input_file, 'r') as input:
