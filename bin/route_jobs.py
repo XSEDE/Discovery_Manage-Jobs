@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 
-# Route computing_activity messages
-#   and synchronize ComputingQueue Model state
+# Expand ComputingQueue Model contents
 #   into the ComputingActvities Model
-# from a source (amqp, file, directory)
+# from a source (Model, amqp, file, directory)
 #   to a destination (print, directory, warehouse, api)
 
 from __future__ import print_function
@@ -57,16 +56,19 @@ a_cache_ts = timezone.now()
 
 #
 # Time capture sequence:
-#   Job.CreationTime: when the job entry was captured (origin) AT THE SP
+#   Job.CreationTime: when the job entry was captured AT THE SP (origin)
 #   QueueReceivedTS:  when the job queue was received by the glue2 router
-#                   which is stored in ComputingQueue
-#   Iter_StartTS:   when this job queue processing started by the job router
-#   timezone.now(): when this job queue processing finished (when we're called)
+#                     to store in the ComputingQueue model
+#   ProcessStartTS:   when the job queue processing started by the job router
+#   timezone.now():   when the job queue processing finished (when we're called)
 #
 # Timings collected:
-#    recv_*         timing from job capture at SP to received by router (average for jobs)
-#    pstart_*       timing from job received by router to processing started (average for queues)
-#    pdone_*        timing from processing started to processing done (average for queues)
+#    recv_*         elapsed from job capture at SP to received by glue2 router
+#                   (average for all jobs in a queue which should be identical)
+#    pstart_*       elapsed from job received by glue2 router to processing started in jobs router
+#                   (average for queues)
+#    pdone_*        timing from processing started in jobs router to processing done
+#                   (average for queues)
 #
 # Performance metrics for each resource
 # -> [ResourceID] -> 'queue_count' = <total job queues was processed>
@@ -77,13 +79,13 @@ a_cache_ts = timezone.now()
 #                                   to processing started
 #                 -> 'totaltime_pdone' = <total time from processing started to done
 #
-p_metrics = {}
-p_metrics_count = 0
-p_metrics_enabled = False   # When we start procesing recent queues
+PerfMet = {}
+PerfMet_count = 0
+PerfMet_enabled = False   # When we start procesing recent queues
 
-def capture_metrics(ResourceID, Jobs, QueueReceivedTS, Iter_StartTS):
-    global p_metrics_enabled
-    if not p_metrics_enabled:
+def capture_metrics(ResourceID, Jobs, QueueReceivedTS, ProcessStartTS):
+    global PerfMet_enabled
+    if not PerfMet_enabled:
         return
     recv_ttime = 0
     recv_count = 0
@@ -102,48 +104,48 @@ def capture_metrics(ResourceID, Jobs, QueueReceivedTS, Iter_StartTS):
                 recv_count += 1
                 recv_ttime += (QueueReceivedTS - capture_time).total_seconds()
 
-#    print('{}: {} {} {}'.format(ResourceID, first_capture, QueueReceivedTS, Iter_StartTS))
+#    print('{}: {} {} {}'.format(ResourceID, first_capture, QueueReceivedTS, ProcessStartTS))
 
-    global p_metrics
-    if ResourceID not in p_metrics:
-        p_metrics[ResourceID] = {'queue_count': 0, 'jobs_count': 0, 'totaltime_recv': 0, 'totaltime_pstart': 0, 'totaltime_proc': 0}
-    my_pm = p_metrics[ResourceID]
+    global PerfMet
+    if ResourceID not in PerfMet:
+        PerfMet[ResourceID] = {'queue_count': 0, 'jobs_count': 0, 'totaltime_recv': 0, 'totaltime_pstart': 0, 'totaltime_proc': 0}
+    my_pm = PerfMet[ResourceID]
     my_pm['queue_count'] += 1
     my_pm['jobs_count'] += recv_count
     if recv_count > 0:
         my_pm['totaltime_recv'] += recv_ttime / recv_count   # The average for jobs in a queue
-    my_pm['totaltime_pstart'] += (Iter_StartTS - QueueReceivedTS).total_seconds()
-    my_pm['totaltime_proc'] += (timezone.now() - Iter_StartTS).total_seconds()
-    global p_metrics_count
-    p_metrics_count += 1
+    my_pm['totaltime_pstart'] += (ProcessStartTS - QueueReceivedTS).total_seconds()
+    my_pm['totaltime_proc'] += (timezone.now() - ProcessStartTS).total_seconds()
+    global PerfMet_count
+    PerfMet_count += 1
 
-def dump_metrics(self):
-    global p_metrics_count
-    if p_metrics_count <= 100:
+def dumPerfMet(self):
+    global PerfMet_count
+    if PerfMet_count <= 100:
         return
-    global p_metrics
+    global PerfMet
     t_count = 0
     t_items = 0
     t_recv = 0
     t_pstart = 0
     t_proc = 0
-    for ResourceID in p_metrics:
-        my_pm = p_metrics[ResourceID]
+    for ResourceID in PerfMet:
+        my_pm = PerfMet[ResourceID]
         if my_pm['queue_count'] > 0:
             avg_jobs = my_pm['jobs_count'] / my_pm['queue_count']
             avg_recv = my_pm['totaltime_recv'] / my_pm['queue_count']
             avg_pstart = my_pm['totaltime_pstart'] / my_pm['queue_count']
             avg_proc = my_pm['totaltime_proc'] / my_pm['queue_count']
-            self.logger.debug('resource={} {}/items: jobs/item={}, to_receive={}, to_beginprocess={}, to_process={}'.format(ResourceID, my_pm['queue_count'], avg_jobs, avg_recv, avg_pstart, avg_proc))
+            self.logger.debug('METRICS resourceid={} {}/items: jobs/item={}, to_receive={}, to_beginprocess={}, to_process={}'.format(ResourceID, my_pm['queue_count'], avg_jobs, avg_recv, avg_pstart, avg_proc))
             t_count += 1
             t_items += my_pm['queue_count']
             t_recv += avg_recv
             t_pstart += avg_pstart
             t_proc += avg_proc
 
-    self.logger.info('METRICS {}/items: to_receive={}, to_beginprocess={}, to_process={}, end-to-end={}'.format(t_items, t_recv / t_count, t_pstart / t_count, t_proc / t_count, (t_recv / t_count) + (t_pstart / t_count) + (t_proc / t_count)))
-    p_metrics = {}
-    p_metrics_count = 0
+    self.logger.info('METRICS AVERAGE {}/items: to_receive={}, to_beginprocess={}, to_process={}, end-to-end={}'.format(t_items, t_recv / t_count, t_pstart / t_count, t_proc / t_count, (t_recv / t_count) + (t_pstart / t_count) + (t_proc / t_count)))
+    PerfMet = {}
+    PerfMet_count = 0
 
 def get_Validity(obj):
     try:
@@ -476,50 +478,50 @@ class Route_Jobs():
     def process_queuetable(self):
         # Frequency to load ComputingQueue (our input)
         Queue_RefreshInterval = timedelta(seconds=5)
-        Queue_RefreshTS = timezone.now() - Queue_RefreshInterval # Force initial refresh
-        Queue = {}
+        Queue_RefreshTS = timezone.now() - Queue_RefreshInterval # In the past to force initial refresh
+        Queue_In = {}
         Queue_Done = {}
 
         while True:
-            Iter_StartTS = timezone.now()                  # Start timestamp
-            Iter_Processed = 0                             # How many resource queues we processed
-            Iter_Sleep = 0                                 # Default no sleep at end of iteration
+            ProcessStartTS = timezone.now()                  # Processing start timestamp
+            Iter_Processed = 0                               # How many resource queues we processed
+            Iter_Sleep = 0                                   # Default no sleep at end of iteration
             
-            if Iter_StartTS > Queue_RefreshTS:             # Refresh the input queue if past target TS
-                Queue = {}
+            if ProcessStartTS > Queue_RefreshTS:             # Refresh the input queue if past the refresh TS
+                Queue_In = {}
                 objects = ComputingQueue.objects.all()
                 for obj in objects:
                     sortkey = '{:%Y-%m-%d %H:%M:%S.%f}:{}'.format(obj.CreationTime, obj.ResourceID)
-                    Queue[sortkey] = obj
+                    Queue_In[sortkey] = obj
                 Queue_RefreshTS = timezone.now() + Queue_RefreshInterval  # Next refresh
         
-            for key in sorted(Queue):
-                ResourceID = Queue[key].ResourceID
-                CreationTime = Queue[key].CreationTime
+            for key in sorted(Queue_In):
+                ResourceID = Queue_In[key].ResourceID
+                CreationTime = Queue_In[key].CreationTime
                 if Queue_Done.get(ResourceID) == CreationTime:
                     continue # No change since last processed
-                Jobs = Queue[key].EntityJSON
+                Jobs = Queue_In[key].EntityJSON
                 self.process_jobs(ResourceID, CreationTime, Jobs)
-                capture_metrics(ResourceID, Jobs, CreationTime, Iter_StartTS)
+                capture_metrics(ResourceID, Jobs, CreationTime, ProcessStartTS)
                 Queue_Done[ResourceID] = CreationTime
                 Iter_Processed += 1
                 if timezone.now() > Queue_RefreshTS:       # Break out to refresh the queue
                     break
-            else: # We finished the sorted(Queue)
+            else: # We finished the sorted(Queue_In)
                 Iter_Sleep = max(0.01, (Queue_RefreshTS - timezone.now()).total_seconds()) # At least 1/100 sec.
 
             Iter_FinishTS = timezone.now()
-            Iter_Seconds = (Iter_FinishTS - Iter_StartTS).total_seconds()
+            Iter_Seconds = (Iter_FinishTS - ProcessStartTS).total_seconds()
             if Iter_Sleep == 0:
                 self.logger.info('Iteration {}/queues in {:0.6f}/sec'.format(Iter_Processed, Iter_Seconds ))
             else:
                 if Iter_Processed > 0:
                     self.logger.info('Iteration {}/queues in {:0.6f}/sec, sleeping={:0.6f}/sec'.format(Iter_Processed, Iter_Seconds, Iter_Sleep))
-                dump_metrics(self)
+                dumPerfMet(self)
                 try:
                     sleep(Iter_Sleep)
-                    global p_metrics_enabled
-                    p_metrics_enabled = True
+                    global PerfMet_enabled
+                    PerfMet_enabled = True
                 except KeyboardInterrupt:
                     raise
                 except Exception:
