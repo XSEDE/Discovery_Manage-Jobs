@@ -220,7 +220,7 @@ class Route_Jobs():
             if 'SOURCE' in self.config:
                 self.args.src = self.config['SOURCE']
         if 'src' not in self.args or not self.args.src:
-            self.args.src = 'amqp:info1.dyn.xsede.org:5671'
+            self.args.src = 'amqp:infopub.xsede.org:5671'
         idx = self.args.src.find(':')
         if idx > 0:
             (self.src['type'], self.src['obj']) = (self.args.src[0:idx], self.args.src[idx+1:])
