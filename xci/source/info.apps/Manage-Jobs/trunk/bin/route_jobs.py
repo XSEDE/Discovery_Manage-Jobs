@@ -561,10 +561,13 @@ class Route_Jobs():
                 self.stats.add('%s.ToCache' % me, 1)
                 continue
 
+            new_name = self.new[me][ID].get('Name', 'none')
+            if new_name is not None:
+                new_name = new_name[:128]
             try:
                 model = ComputingActivity(ID=self.new[me][ID]['ID'],
                                           ResourceID=self.resourceid,
-                                          Name=self.new[me][ID].get('Name', 'none'),
+                                          Name=new_name,
                                           CreationTime=self.new[me][ID]['CreationTime'],
                                           Validity=get_Validity(self.new[me][ID]),
                                           EntityJSON=self.new[me][ID])
