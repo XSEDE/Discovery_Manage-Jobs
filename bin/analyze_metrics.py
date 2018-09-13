@@ -41,7 +41,7 @@ with open(input_file, 'r') as input:
         which = fields[4]
 #       pdb.set_trace()
         if which not in stats:
-	    stats[which] = deepcopy(of_interest)
+            stats[which] = deepcopy(of_interest)
         for i in range(5, len(fields)):           # Remaining fields
             for prefix in of_interest:
                 if fields[i].startswith(prefix):

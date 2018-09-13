@@ -548,9 +548,13 @@ class Route_Jobs():
         self.new[me] = {}
         self.cur[me] = {}
 
-        self.new[me] = Jobs
-        self.stats.set('%s.New' % me, len(Jobs))
-        self.logger.debug('Processing {} {}/jobs'.format(ResourceID, len(Jobs)))
+# Filter out 'Extensions' and other non-jobs
+#        self.new[me] = Jobs
+        for k in Jobs:
+            if k.startswith('urn:glue2:ComputingActivity:'):
+                self.new[me][k] = Jobs[k]
+        self.stats.set('%s.New' % me, len(self.new[me]))
+        self.logger.debug('Processing {} {}/jobs'.format(ResourceID, len(self.new[me])))
 
         # Load current database entries
         if not self.cur[me]:
