@@ -321,24 +321,30 @@ class Route_Jobs():
         sys.exit(0)
     
     def ConnectAmqp_Anonymous(self):
-        return amqp.Connection(host='%s:%s' % (self.src['host'], self.src['port']), virtual_host='xsede')
+        conn = amqp.Connection(host='%s:%s' % (self.src['host'], self.src['port']), virtual_host='xsede')
     #                           heartbeat=2)
+        conn.connect()
+        return conn
 
     def ConnectAmqp_UserPass(self):
         ssl_opts = {'ca_certs': os.environ.get('X509_USER_CERT')}
-        return amqp.Connection(host='%s:%s' % (self.src['host'], self.src['port']), virtual_host='xsede',
+        conn = amqp.Connection(host='%s:%s' % (self.src['host'], self.src['port']), virtual_host='xsede',
                                userid=self.config['AMQP_USERID'], password=self.config['AMQP_PASSWORD'],
     #                           heartbeat=1,
                                heartbeat=240,
                                ssl=ssl_opts)
+        conn.connect()
+        return conn
 
     def ConnectAmqp_X509(self):
         ssl_opts = {'ca_certs': self.config['X509_CACERTS'],
                    'keyfile': '/path/to/key.pem',
                    'certfile': '/path/to/cert.pem'}
-        return amqp.Connection(host='%s:%s' % (self.src['host'], self.src['port']), virtual_host='xsede',
+        conn = amqp.Connection(host='%s:%s' % (self.src['host'], self.src['port']), virtual_host='xsede',
     #                           heartbeat=2,
                                ssl=ssl_opts)
+        conn.connect()
+        return conn
 
     def src_amqp(self):
         return
@@ -391,11 +397,12 @@ class Route_Jobs():
             return
 
         headers = {'Content-type': 'application/json',
-            'Authorization': 'Basic %s' % base64.standard_b64encode( self.config['API_USERID'] + ':' + self.config['API_PASSWORD']) }
+            'Authorization': 'Basic %s' % base64.standard_b64encode( (self.config['API_USERID'] + ':' + self.config['API_PASSWORD']).encode() ).decode() }
         url = '/glue2-provider-api/v1/process/doctype/%s/resourceid/%s/' % (doctype, resourceid)
         if self.dest['host'] not in ['localhost', '127.0.0.1'] and self.dest['port'] != '8000':
             url = '/wh1' + url
-        (host, port) = (self.dest['host'].encode('utf-8'), self.dest['port'].encode('utf-8'))
+#        (host, port) = (self.dest['host'].encode('utf-8'), self.dest['port'].encode('utf-8'))
+        (host, port) = (self.dest['host'], self.dest['port'])
         retries = 0
         while retries < 100:
             try:
@@ -645,7 +652,7 @@ class Route_Jobs():
             st = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
             self.channel.basic_consume(queue,callback=self.amqp_callback)
             while True:
-                self.channel.wait()
+                self.channel.wait(amqp.spec.Connection.Blocked)
 
         elif self.src['type'] == 'file':
             self.src['obj'] = os.path.abspath(self.src['obj'])
