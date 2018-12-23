@@ -190,9 +190,9 @@ class Route_Jobs():
             pdb.set_trace()
 
         # Load configuration file
-        config_file = os.path.abspath(self.args.config)
+        self.config_file = os.path.abspath(self.args.config)
         try:
-            with open(config_file, 'r') as file:
+            with open(self.config_file, 'r') as file:
                 conf=file.read()
                 file.close()
         except IOError as e:
@@ -200,7 +200,7 @@ class Route_Jobs():
         try:
             self.config = json.loads(conf)
         except ValueError as e:
-            self.logger.error('Error "{}" parsing config={}'.format(e, config_file))
+            self.logger.error('Error "{}" parsing config={}'.format(e, self.config_file))
             sys.exit(1)
 
         # Initialize logging
@@ -335,8 +335,7 @@ class Route_Jobs():
         ssl_opts = {'ca_certs': os.environ.get('X509_USER_CERT')}
         conn = amqp.Connection(host='{}:{}'.format(self.src['host'], self.src['port']), virtual_host='xsede',
                                userid=self.config['AMQP_USERID'], password=self.config['AMQP_PASSWORD'],
-    #                           heartbeat=1,
-                               heartbeat=240,
+                               heartbeat=60,
                                ssl=ssl_opts)
         conn.connect()
         return conn
@@ -346,28 +345,10 @@ class Route_Jobs():
                    'keyfile': '/path/to/key.pem',
                    'certfile': '/path/to/cert.pem'}
         conn = amqp.Connection(host='{}:{}'.format(self.src['host'], self.src['port']), virtual_host='xsede',
-    #                           heartbeat=2,
+                               heartbeat=60,
                                ssl=ssl_opts)
         conn.connect()
         return conn
-
-    def src_amqp(self):
-        return
-
-    def amqp_callback(self, message):
-        st = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        doctype = message.delivery_info['exchange']
-        tag = message.delivery_tag
-        resourceid = message.delivery_info['routing_key']
-        if self.dest['type'] == 'print':
-            self.dest_print(st, doctype, resourceid, message.body)
-        elif self.dest['type'] == 'directory':
-            self.dest_directory(st, doctype, resourceid, message.body)
-        elif self.dest['type'] == 'warehouse':
-            self.dest_warehouse(st, doctype, resourceid, message.body)
-        elif self.dest['type'] == 'api':
-            self.dest_restapi(st, doctype, resourceid, message.body)
-        self.channel.basic_ack(delivery_tag=tag)
 
     def dest_print(self, st, doctype, resourceid, message_body):
         print('{} exchange={}, routing_key={}, size={}, dest=PRINT'.format(st, doctype, resourceid, len(message_body) ) )
@@ -632,6 +613,31 @@ class Route_Jobs():
             hash_list.append(obj['UsedTotalWallTime'])
         return(json.dumps(hash_list))
 
+    def amqp_consume_setup(self):
+        now = datetime.utcnow()
+        try:
+            if (now - self.amqp_consume_setup_last).seconds < 300:  # 5 minutes
+                self.logger.error('Too recent amqp_consume_setup, quitting...')
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except:
+            pass
+        self.amqp_consume_setup_last = now
+
+        self.conn = self.ConnectAmqp_UserPass()
+        self.channel = self.conn.channel()
+        self.channel.basic_qos(prefetch_size=0, prefetch_count=4, a_global=True)
+        which_queue = self.args.queue or self.config.get('QUEUE', 'jobs-router')
+        queue = self.channel.queue_declare(queue=which_queue, durable=True, auto_delete=False).queue
+        exchanges = ['glue2.computing_activities']
+        for ex in exchanges:
+            self.channel.queue_bind(queue, ex, '#')
+        self.logger.info('AMQP Queue={}, Exchanges=({})'.format(which_queue, ', '.join(exchanges)))
+        st = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.channel.basic_consume(queue, callback=self.amqp_callback)
+
+
 ###############################################################################################
 # Where we process
 ###############################################################################################
@@ -643,20 +649,25 @@ class Route_Jobs():
         self.logger.info('Destination: ' + self.dest['display'])
 
         if self.src['type'] == 'amqp':
-            conn = self.ConnectAmqp_UserPass()
-            self.channel = conn.channel()
-            self.channel.basic_qos(prefetch_size=0, prefetch_count=4, a_global=True)
-            which_queue = self.args.queue or self.config.get('QUEUE', 'jobs-router')
-            declare_ok = self.channel.queue_declare(queue=self.args.queue, durable=True, auto_delete=False)
-            queue = declare_ok.queue
-            exchanges = ['glue2.computing_activities']
-            for ex in exchanges:
-                self.channel.queue_bind(queue, ex, '#')
-            self.logger.info('AMQP Queue={}, Exchanges=({})'.format(which_queue, ', '.join(exchanges)))
-            st = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            self.channel.basic_consume(queue,callback=self.amqp_callback)
+            self.amqp_consume_setup()
             while True:
-                self.channel.wait(amqp.spec.Connection.Blocked)
+                try:
+                    self.conn.drain_events()
+                    self.conn.heartbeat_tick(rate=2)
+                    continue # Loops back to the while
+                except (socket.timeout):
+                    self.logger.info('AMQP drain_events timeout, sending heartbeat')
+                    self.conn.heartbeat_tick(rate=2)
+                    sleep(5)
+                    continue
+                except Exception as err:
+                    self.logger.error('AMQP drain_events error: ' + format(err))
+                try:
+                    self.conn.close()
+                except Exception as err:
+                    self.logger.error('AMQP connection.close error: ' + format(err))
+                sleep(30)   # Sleep a little and then try to reconnect
+                self.amqp_consume_setup()
 
         elif self.src['type'] == 'file':
             self.src['obj'] = os.path.abspath(self.src['obj'])
