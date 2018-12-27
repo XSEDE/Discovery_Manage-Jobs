@@ -1,0 +1,18 @@
+[Unit]
+Description=Information Services Jobs Router 
+After=network.target remote-fs.target nss-lookup.target
+
+[Service]
+Type=forking
+EnvironmentFile=/soft/warehouse-apps-1.0/Manage-Jobs/PROD/sbin/route_jobs.sysconfig
+ExecStart=/soft/warehouse-apps-1.0/Manage-Jobs/PROD/sbin/route_jobs.daemon start
+ExecReload=/soft/warehouse-apps-1.0/Manage-Jobs/PROD/sbin/route_jobs.daemon restart
+ExecStop=/soft/warehouse-apps-1.0/Manage-Jobs/PROD/sbin/route_jobs.daemon stop
+PIDFile=/soft/warehouse-apps-1.0/Manage-Jobs/var/route_jobs.pid
+#PrivateTmp=true
+User=software
+Group=admin
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
