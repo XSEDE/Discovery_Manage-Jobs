@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Expand ComputingQueue Model contents
-#   into the ComputingActvities Model
+#   into the ComputingActivity Model
 # from a source (Model, amqp, file, directory)
 #   to a destination (print, directory, warehouse, api)
 
@@ -553,6 +553,11 @@ class Route_Jobs():
                 continue
 
             new_name = self.new[me][ID].get('Name', 'none')
+            try:
+                new_localowner = self.new[me][ID].get('LocalOwner', 'unknown')
+            except:
+                new_localowner = 'unknown'
+            
             if new_name is not None:
                 new_name = new_name[:128]
             try:
@@ -561,6 +566,7 @@ class Route_Jobs():
                                           Name=new_name,
                                           CreationTime=self.new[me][ID]['CreationTime'],
                                           Validity=get_Validity(self.new[me][ID]),
+                                          LocalOwner=new_localowner,
                                           EntityJSON=self.new[me][ID])
                 model.save()
 #               self.new[me][ID]['model'] = model
