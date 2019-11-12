@@ -325,16 +325,11 @@ class Route_Jobs():
         self.logger.error('Caught signal, exiting...')
         sys.exit(0)
     
-    def ConnectAmqp_Anonymous(self):
-        conn = amqp.Connection(host='{}:{}'.format(self.src['host'], self.src['port']), virtual_host='xsede')
-    #                           heartbeat=2)
-        conn.connect()
-        return conn
-
     def ConnectAmqp_UserPass(self):
         ssl_opts = {'ca_certs': os.environ.get('X509_USER_CERT')}
-        conn = amqp.Connection(host='{}:{}'.format(self.src['host'], self.src['port']), virtual_host='xsede',
-                               userid=self.config['AMQP_USERID'], password=self.config['AMQP_PASSWORD'],
+        conn = amqp.Connection(login_method='AMQPLAIN', virtual_host='xsede',
+                host='{}:{}'.format(self.src['host'], self.src['port']),
+                userid=self.config['AMQP_USERID'], password=self.config['AMQP_PASSWORD'],
                                heartbeat=60,
                                ssl=ssl_opts)
         conn.connect()
@@ -344,7 +339,7 @@ class Route_Jobs():
         ssl_opts = {'ca_certs': self.config['X509_CACERTS'],
                    'keyfile': '/path/to/key.pem',
                    'certfile': '/path/to/cert.pem'}
-        conn = amqp.Connection(host='{}:{}'.format(self.src['host'], self.src['port']), virtual_host='xsede',
+        conn = amqp.Connection(login_method='EXTERNAL', host='{}:{}'.format(self.src['host'], self.src['port']), virtual_host='xsede',
                                heartbeat=60,
                                ssl=ssl_opts)
         conn.connect()
