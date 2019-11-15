@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 from copy import deepcopy
 # Analayze metrics in input_file of the form:
 #2017-11-17 00:33:46,225 DEBUG METRICS resourceid=xstream.stanford.xsede.org 15/items: jobs/item=2925, to_receive=13.5759758358, to_beginprocess=46.4138246667, to_process=14.295467
