@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
 # Expand ComputingQueue Model contents
 #   into the ComputingActivity Model
