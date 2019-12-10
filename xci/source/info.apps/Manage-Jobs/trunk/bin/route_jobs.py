@@ -213,7 +213,7 @@ class Route_Jobs():
             numeric_log = getattr(logging, 'INFO', None)
         if not isinstance(numeric_log, int):
             raise ValueError('Invalid log level: {}'.format(numeric_log))
-        self.logger = logging.getLogger('xsede.glue2')
+        self.logger = logging.getLogger('xsede.logger')
         self.logger.setLevel(numeric_log)
 
         # Verify arguments and parse compound arguments
