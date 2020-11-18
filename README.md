@@ -1,4 +1,4 @@
-# XSEDE Information Services - Manage-Jobs
+# Manage-Jobs Router for XSEDE Information Services
 
 Route Jobs messages, typically:
 * From the pub/sub service
