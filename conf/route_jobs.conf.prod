@@ -1,0 +1,11 @@
+{
+    "SOURCE": "queuetable",
+    "DESTINATION_FILE": "file:jobs.json",
+    "DESTINATION": "warehouse",
+    "AMQP_USERID": "glue2-jobs",
+    "AMQP_PASSWORD": "xxxxxxxxxxxxxxx",
+    "LOG_FILE": "/soft/warehouse-apps-1.0/Manage-Jobs/var/route_jobs.log",
+    "LOG_LEVEL": "warning",
+    "RUN_DIR": "/soft/warehouse-apps-1.0/Manage-Jobs/var",
+    "PID_FILE": "/soft/warehouse-apps-1.0/Manage-Jobs/var/route_jobs.pid"
+}
