@@ -609,13 +609,16 @@ class Router():
             if new_name is not None:
                 new_name = new_name[:128]
             try:
-                model = ComputingActivity(ID=self.new[me][ID]['ID'],
-                                          ResourceID=self.resourceid,
-                                          Name=new_name,
-                                          CreationTime=self.new[me][ID]['CreationTime'],
-                                          Validity=get_Validity(self.new[me][ID]),
-                                          LocalOwner=new_localowner,
-                                          EntityJSON=self.new[me][ID])
+                model, created = ComputingActivity.objects.update_or_create(
+                            ID=self.new[me][ID]['ID'],
+                            defaults = {
+                                'ResourceID': self.resourceid,
+                                'Name': new_name,
+                                'CreationTime': self.new[me][ID]['CreationTime'],
+                                'Validity': get_Validity(self.new[me][ID]),
+                                'LocalOwner': new_localowner,
+                                'EntityJSON': self.new[me][ID]
+                            })
                 model.save()
 #               self.new[me][ID]['model'] = model
                 self.stats.add('{}.Updates'.format(me), 1)
